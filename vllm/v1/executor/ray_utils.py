@@ -4,15 +4,15 @@
 import os
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from concurrent.futures import Future
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Any, Union
 
 import numpy as np
 
 import vllm.platforms
 from vllm.config import ParallelConfig
 from vllm.distributed import get_pp_group
-from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -246,7 +246,11 @@ class FutureWrapper(Future):
     the result() call. If not only the first worker's output is returned.
     """
 
-    def __init__(self, ref_or_refs, aggregator: KVOutputAggregator | None = None):
+    def __init__(
+        self,
+        ref_or_refs,
+        aggregator: Callable[[list[Any]], Any] | None = None,
+    ):
         super().__init__()
         self.ref_or_refs = ref_or_refs
         self.aggregator = aggregator
@@ -258,8 +262,9 @@ class FutureWrapper(Future):
             return outputs
 
         for output in outputs:
-            detach_zero_copy_from_model_runner_output(output)
-        return self.aggregator.aggregate(outputs, output_rank=0)
+            if output is not None:
+                detach_zero_copy_from_model_runner_output(output)
+        return self.aggregator(outputs)
 
 
 def ray_is_available() -> bool:

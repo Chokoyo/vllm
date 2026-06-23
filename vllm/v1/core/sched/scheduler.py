@@ -10,6 +10,7 @@ from typing import Any
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
+    ECConnectorCacheStatus,
     ECConnectorMetadata,
     ECConnectorRole,
 )
@@ -196,6 +197,11 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        # EC Connector: requests waiting for an async encoder-cache item.
+        # Invariant: key present iff status is WAITING_FOR_EC_EMBEDDING.
+        # Maps request_id -> mm_hash. Unlike KV, EC completions are keyed by
+        # mm_hash, so the scheduler needs this extra lookup while waiting.
+        self._ec_pending_mm_hash_by_req_id: dict[str, str] = {}
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
@@ -488,6 +494,7 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens,
                     new_encoder_compute_budget,
                     external_load_encoder_input,
+                    _pending_ec_mm_hash,
                 ) = self._try_schedule_encoder_inputs(
                     request,
                     request.num_computed_tokens,
@@ -495,6 +502,9 @@ class Scheduler(SchedulerInterface):
                     encoder_compute_budget,
                     shift_computed_tokens=1 if self.use_eagle else 0,
                 )
+                # Only waiting requests are parked on pending EC loads. Running
+                # requests keep their KV blocks and schedule 0 tokens until the
+                # EC item is ready.
 
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
@@ -748,18 +758,6 @@ class Scheduler(SchedulerInterface):
                     )
                     assert num_computed_tokens <= request.num_tokens
 
-                    # Skip request with pending mm encoding prefetches
-                    if (
-                        self.ec_connector is not None
-                        and request.mm_features
-                        and not self.ec_connector.ensure_cache_available(
-                            request, num_computed_tokens
-                        )
-                    ):
-                        request_queue.pop_request()
-                        step_skipped_waiting.prepend_request(request)
-                        continue
-
                     # Track first scheduled prefill, not post-preemption repeat prefills
                     if request.prefill_stats is not None:
                         assert num_computed_tokens <= request.num_prompt_tokens
@@ -813,18 +811,32 @@ class Scheduler(SchedulerInterface):
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
+                        defer_pending_ec_embedding = (
+                            bool(num_scheduled_tokens)
+                            or len(self.waiting) + len(self.skipped_waiting) > 1
+                        )
                         (
                             encoder_inputs_to_schedule,
                             num_new_tokens,
                             new_encoder_compute_budget,
                             external_load_encoder_input,
+                            pending_ec_mm_hash,
                         ) = self._try_schedule_encoder_inputs(
                             request,
                             num_computed_tokens,
                             num_new_tokens,
                             encoder_compute_budget,
                             shift_computed_tokens=1 if self.use_eagle else 0,
+                            defer_pending_ec_embedding=defer_pending_ec_embedding,
                         )
+                        if pending_ec_mm_hash is not None:
+                            request.status = RequestStatus.WAITING_FOR_EC_EMBEDDING
+                            self._ec_pending_mm_hash_by_req_id[request.request_id] = (
+                                pending_ec_mm_hash
+                            )
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
                             break
@@ -1113,6 +1125,7 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        self._ec_pending_mm_hash_by_req_id.pop(request.request_id, None)
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
@@ -1284,7 +1297,8 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         encoder_compute_budget: int,
         shift_computed_tokens: int = 0,
-    ) -> tuple[list[int], int, int, list[int]]:
+        defer_pending_ec_embedding: bool = True,
+    ) -> tuple[list[int], int, int, list[int], str | None]:
         """
         Determine which encoder inputs need to be scheduled in the current step,
         and update `num_new_tokens` and encoder token budget accordingly.
@@ -1306,7 +1320,7 @@ class Scheduler(SchedulerInterface):
         blocks and externally cached blocks (via KVConnector).
         """
         if num_new_tokens == 0 or not request.has_encoder_inputs:
-            return [], num_new_tokens, encoder_compute_budget, []
+            return [], num_new_tokens, encoder_compute_budget, [], None
         encoder_inputs_to_schedule: list[int] = []
         mm_features = request.mm_features
         assert mm_features is not None
@@ -1417,13 +1431,26 @@ class Scheduler(SchedulerInterface):
             if curr_embeds_end - curr_embeds_start == 0:
                 continue
 
-            if self.ec_connector is not None and self.ec_connector.has_cache_item(
-                item_identifier
-            ):
-                mm_hashes_to_schedule.add(item_identifier)
-                external_load_encoder_input.append(i)
-                num_embeds_to_schedule += num_encoder_embeds
-                continue
+            if self.ec_connector is not None:
+                ec_status = self.ec_connector.get_cache_status(item_identifier)
+                if ec_status == ECConnectorCacheStatus.READY:
+                    mm_hashes_to_schedule.add(item_identifier)
+                    external_load_encoder_input.append(i)
+                    num_embeds_to_schedule += num_encoder_embeds
+                    continue
+                elif ec_status == ECConnectorCacheStatus.PENDING:
+                    if defer_pending_ec_embedding:
+                        if num_computed_tokens + shift_computed_tokens < start_pos:
+                            num_new_tokens = start_pos - (
+                                num_computed_tokens + shift_computed_tokens
+                            )
+                            break
+                        return [], 0, encoder_compute_budget, [], item_identifier
+                    # Avoid idling the engine when this is the only schedulable
+                    # work. Treat the pending EC item as a miss and compute the
+                    # encoder output locally.
+                else:
+                    assert ec_status == ECConnectorCacheStatus.MISS, ec_status
 
             num_embeds_to_schedule += num_encoder_embeds
             encoder_compute_budget -= num_encoder_embeds
@@ -1435,6 +1462,7 @@ class Scheduler(SchedulerInterface):
             num_new_tokens,
             encoder_compute_budget,
             external_load_encoder_input,
+            None,
         )
 
     def get_grammar_bitmask(
@@ -1473,6 +1501,7 @@ class Scheduler(SchedulerInterface):
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
+        ec_connector_output = model_runner_output.ec_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
@@ -1733,6 +1762,10 @@ class Scheduler(SchedulerInterface):
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output)
 
+        # EC Connector: update state for finished encoder-cache transfers.
+        if ec_connector_output is not None and self.ec_connector is not None:
+            self.ec_connector.update_connector_output(ec_connector_output)
+
         # Worker-side KV connector stats from the model runner output.
         kv_connector_stats: KVConnectorStats | None = (
             kv_connector_output.kv_connector_stats if kv_connector_output else None
@@ -1807,6 +1840,7 @@ class Scheduler(SchedulerInterface):
         return status in (
             RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
             RequestStatus.WAITING_FOR_REMOTE_KVS,
+            RequestStatus.WAITING_FOR_EC_EMBEDDING,
             RequestStatus.WAITING_FOR_STREAMING_REQ,
         )
 
@@ -2053,6 +2087,7 @@ class Scheduler(SchedulerInterface):
     ) -> dict[str, Any] | None:
         assert request.is_finished()
 
+        self._ec_pending_mm_hash_by_req_id.pop(request.request_id, None)
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
@@ -2401,6 +2436,33 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.PREEMPTED
             else:
                 request.status = RequestStatus.WAITING
+            return True
+
+        if request.status == RequestStatus.WAITING_FOR_EC_EMBEDDING:
+            mm_hash = self._ec_pending_mm_hash_by_req_id.get(request.request_id)
+            if mm_hash is None or self.ec_connector is None:
+                self._ec_pending_mm_hash_by_req_id.pop(request.request_id, None)
+                request.status = (
+                    RequestStatus.PREEMPTED
+                    if request.num_preemptions
+                    else RequestStatus.WAITING
+                )
+                return True
+
+            ec_status = self.ec_connector.get_cache_status(mm_hash)
+            if ec_status == ECConnectorCacheStatus.PENDING:
+                return False
+            assert (
+                ec_status == ECConnectorCacheStatus.READY
+                or ec_status == ECConnectorCacheStatus.MISS
+            ), ec_status
+
+            self._ec_pending_mm_hash_by_req_id.pop(request.request_id, None)
+            request.status = (
+                RequestStatus.PREEMPTED
+                if request.num_preemptions
+                else RequestStatus.WAITING
+            )
             return True
 
         if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:

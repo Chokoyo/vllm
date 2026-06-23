@@ -47,6 +47,12 @@ class ECConnectorRole(enum.Enum):
     WORKER = 1
 
 
+class ECConnectorCacheStatus(str, enum.Enum):
+    READY = "READY"
+    PENDING = "PENDING"
+    MISS = "MISS"
+
+
 class ECConnectorMetadata(ABC):  # noqa: B024
     """
     Abstract Metadata used to communicate between the
@@ -154,6 +160,18 @@ class ECConnectorBase(ABC):
         """
         pass
 
+    def wait_for_load_caches(
+        self, encoder_cache: dict[str, torch.Tensor], **kwargs
+    ) -> None:
+        """
+        Wait for cache loads started by start_load_caches, if any.
+
+        Synchronous connectors can rely on the default no-op. Async connectors
+        may override this to let H2D loads overlap with encoder work and fence
+        them immediately before the loaded embeddings are consumed.
+        """
+        return None
+
     @abstractmethod
     def save_caches(
         self, encoder_cache: dict[str, torch.Tensor], mm_hash: str, **kwargs
@@ -211,22 +229,29 @@ class ECConnectorBase(ABC):
         """
         pass
 
-    def ensure_cache_available(
-        self, request: "Request", num_computed_tokens: int
-    ) -> bool:
+    def get_cache_status(self, identifier: str) -> ECConnectorCacheStatus:
         """
-        Ensure encoder cache items are available for the given request.
-        May initiate asynchronous transfers for items not yet local.
+        Return the scheduler-side availability state for an encoder cache item.
 
-        Args:
-            request: the request whose multimodal features to check.
-            num_computed_tokens: tokens already covered by cached KV blocks.
-
-        Returns:
-            True if all items are ready or no transfer is needed.
-            False if any items are still in transit (request should be deferred).
+        The default preserves the existing synchronous connector behavior:
+        a cache item is either immediately available or it is a miss. Async
+        connectors can override this to report PENDING while an in-flight load
+        or save must complete before the scheduler can use the item.
         """
-        return True
+        return (
+            ECConnectorCacheStatus.READY
+            if self.has_cache_item(identifier)
+            else ECConnectorCacheStatus.MISS
+        )
+
+    def get_finished_count(self) -> int | None:
+        """
+        Return how many worker completions must be observed for a mm_hash.
+
+        None means callers should conservatively wait for world_size workers,
+        matching KVOutputAggregator's connector default.
+        """
+        return None
 
     @abstractmethod
     def update_state_after_alloc(self, request: "Request", index: int):
