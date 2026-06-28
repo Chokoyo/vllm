@@ -86,8 +86,11 @@ class RayDistributedExecutor(Executor):
         # Create the parallel GPU workers.
         self._init_workers_ray(placement_group)
 
-        # KV connector setup
-        self.has_connector = self.vllm_config.kv_transfer_config is not None
+        # Connector setup
+        self.has_connector = (
+            self.vllm_config.kv_transfer_config is not None
+            or self.vllm_config.ec_transfer_config is not None
+        )
 
         self.uses_sampler = self.vllm_config.model_config.runner_type != "pooling" and (
             self.vllm_config.ec_transfer_config is None
@@ -456,16 +459,20 @@ class RayDistributedExecutor(Executor):
             return FutureWrapper(refs[0])
 
         # Get output from all workers when connector is present
-        assert self.kv_output_aggregator is not None
+        assert (
+            self.kv_output_aggregator is not None
+            or self.ec_output_aggregator is not None
+        )
         if not non_block:
             # Block and get results from all workers
             outputs = ray.get(refs)
             for output in outputs:
-                detach_zero_copy_from_model_runner_output(output)
-            return self.kv_output_aggregator.aggregate(outputs)
+                if output is not None:
+                    detach_zero_copy_from_model_runner_output(output)
+            return self.aggregate_worker_outputs(outputs)
 
         # Return a future that will aggregate outputs from all workers
-        return FutureWrapper(refs, self.kv_output_aggregator)
+        return FutureWrapper(refs, self.aggregate_worker_outputs)
 
     def collective_rpc(  # type: ignore[override]
         self,

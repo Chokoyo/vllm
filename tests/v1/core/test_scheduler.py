@@ -15,6 +15,7 @@ from vllm.config import (
     SpeculativeConfig,
     VllmConfig,
 )
+from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorCacheStatus
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
@@ -4860,17 +4861,16 @@ def test_encoder_cache_recomputed_when_evicted_during_preemption():
     assert manager.check_and_update_cache(request, 0) is False
 
 
+@pytest.mark.parametrize(
+    "ec_status, external_load",
+    [
+        (ECConnectorCacheStatus.READY, True),
+        (ECConnectorCacheStatus.MISS, False),
+    ],
+)
 @pytest.mark.parametrize("use_kv_connector", [False, True])
-def test_ec_connector_ensure_cache_available_defers_request(use_kv_connector):
-    """Test that ensure_cache_available() returning False defers the request.
-
-    When the EC connector signals a prefetch is in progress (returns False),
-    the scheduler should:
-    1. Not schedule the request (no KV cache or encoder cache allocated)
-    2. Still schedule other requests behind the deferred one
-    3. Schedule the deferred request on the next step when ensure_cache_available
-       returns True and has_cache_item returns True
-    """
+def test_ec_connector_pending_embedding_promotes(use_kv_connector, ec_status,
+                                                external_load):
     scheduler = create_scheduler(
         model="llava-hf/llava-1.5-7b-hf",
         enable_prefix_caching=True,
@@ -4879,109 +4879,98 @@ def test_ec_connector_ensure_cache_available_defers_request(use_kv_connector):
         ec_role="ec_consumer",
     )
 
-    NUM_TOKENS = 200
-    NUM_ENCODER_TOKENS = 100
-
-    request_deferred = create_requests(
+    request = create_requests(
         num_requests=1,
-        num_tokens=NUM_TOKENS,
-        mm_positions=[[PlaceholderRange(offset=0, length=NUM_ENCODER_TOKENS)]],
-        req_ids=["deferred"],
+        num_tokens=200,
+        mm_hashes_list=[["pending_hash"]],
+        mm_positions=[[PlaceholderRange(offset=0, length=100)]],
+        req_ids=["pending_req"],
     )[0]
-
-    request_behind = create_requests(
+    text_request = create_requests(
         num_requests=1,
         num_tokens=20,
-        req_ids=["behind"],
+        req_ids=["text_req"],
     )[0]
 
-    # --- Step 1: ensure_cache_available returns False → request deferred ---
-    scheduler.ec_connector.ensure_cache_available = Mock(return_value=False)
+    current_ec_status = ECConnectorCacheStatus.PENDING
+    scheduler.ec_connector.get_cache_status = Mock(
+        side_effect=lambda _: current_ec_status
+    )
+    scheduler.ec_connector.has_cache_item = Mock(return_value=external_load)
 
-    scheduler.add_request(request_deferred)
-    scheduler.add_request(request_behind)
+    scheduler.add_request(request)
+    scheduler.add_request(text_request)
     output = scheduler.schedule()
 
-    # ensure_cache_available must have been called with (request, num_computed_tokens=0)
-    # for a brand-new request that has no cached tokens yet.
-    scheduler.ec_connector.ensure_cache_available.assert_called_once_with(
-        request_deferred, 0
-    )
-    # Deferred request must NOT be scheduled
-    assert request_deferred.request_id not in output.num_scheduled_tokens
+    assert request.request_id not in output.num_scheduled_tokens
+    assert text_request.request_id in output.num_scheduled_tokens
+    assert request.status == RequestStatus.WAITING_FOR_EC_EMBEDDING
+    assert scheduler._ec_pending_mm_hash_by_req_id[request.request_id] == "pending_hash"
     _assert_right_encoder_cache_allocated(scheduler, expected_total_allocated=0)
-    # No KV blocks allocated for the deferred request
-    for mgr in scheduler.kv_cache_manager.coordinator.single_type_managers:
-        assert request_deferred.request_id not in mgr.req_to_blocks
 
-    # The text-only request behind the deferred one MUST still be scheduled
-    assert request_behind.request_id in output.num_scheduled_tokens
-    assert output.num_scheduled_tokens[request_behind.request_id] == 20
-
-    # --- Step 2: prefetch done, cache exists → request scheduled ---
-    # has_cache_item is called inside _try_schedule_encoder_inputs (not during
-    # deferral), so it is only relevant here in step 2.
-    scheduler.ec_connector.ensure_cache_available = Mock(return_value=True)
-    scheduler.ec_connector.has_cache_item = Mock(return_value=True)
-
+    scheduler.finish_requests(text_request.request_id, RequestStatus.FINISHED_ABORTED)
+    current_ec_status = ec_status
     output = scheduler.schedule()
 
-    # Now the deferred request should be scheduled
-    assert request_deferred.request_id in output.num_scheduled_tokens
-    assert output.num_scheduled_tokens[request_deferred.request_id] == NUM_TOKENS
-    _assert_right_encoder_cache_allocated(scheduler, requests=[request_deferred])
-    # EC connector metadata should carry the deferred request's MM data
-    _assert_right_ec_connector_metadata(
-        output, mm_features_list=request_deferred.mm_features
+    assert request.request_id in output.num_scheduled_tokens
+    assert output.num_scheduled_tokens[request.request_id] == 200
+    assert request.status == RequestStatus.RUNNING
+    assert request.request_id not in scheduler._ec_pending_mm_hash_by_req_id
+    _assert_right_encoder_cache_allocated(scheduler, requests=[request])
+    if external_load:
+        _assert_right_ec_connector_metadata(
+            output, mm_features_list=request.mm_features
+        )
+        _assert_right_encoder_inputs(output, expected_total_reqs=0)
+    else:
+        _assert_right_ec_connector_metadata(output, mm_features_list=[])
+        _assert_right_encoder_inputs(
+            output,
+            requests=[request],
+            expected_encoder_inputs=[[0]],
+            expected_total_reqs=1,
+        )
+
+
+@pytest.mark.parametrize("use_kv_connector", [False, True])
+def test_ec_connector_pending_embedding_computes_locally_when_alone(
+    use_kv_connector,
+):
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        enable_prefix_caching=True,
+        use_kv_connector=use_kv_connector,
+        use_ec_connector=True,
+        ec_role="ec_consumer",
     )
-    # No local encoder compute — all loaded externally
-    _assert_right_encoder_inputs(output, expected_total_reqs=0)
-
-
-def test_ec_connector_pending_prefetch_only_checks_future_mm_features():
-    """Test that future mm feature filtering only yields features beyond
-    the computed token frontier.
-
-    Features already within num_computed_tokens (past/boundary) must be
-    filtered out; only features that extend beyond the frontier (future) should
-    be yielded so that connector implementations know which items to prefetch.
-
-    Filter cases:
-      "past":     end = 0  + 16 = 16 <  32 → filtered OUT
-      "boundary": end = 16 + 16 = 32 == 32 → filtered OUT (condition is >, not >=)
-      "future":   end = 48 + 32 = 80 >  32 → yielded
-    """
-    BLOCK_SIZE = 16
-    NUM_COMPUTED_TOKENS = BLOCK_SIZE * 2  # 32
-    NUM_TOKENS = BLOCK_SIZE * 8  # 128
-
-    HASH_PAST = "hash_past"
-    HASH_BOUNDARY = "hash_boundary"
-    HASH_FUTURE = "hash_future"
 
     request = create_requests(
         num_requests=1,
-        num_tokens=NUM_TOKENS,
-        mm_hashes_list=[[HASH_PAST, HASH_BOUNDARY, HASH_FUTURE]],
-        mm_positions=[
-            [
-                PlaceholderRange(offset=0, length=BLOCK_SIZE),  # end=16 (past)
-                PlaceholderRange(offset=16, length=BLOCK_SIZE),  # end=32 (boundary)
-                PlaceholderRange(offset=48, length=BLOCK_SIZE * 2),  # end=80 (future)
-            ]
-        ],
-        block_size=BLOCK_SIZE,
+        num_tokens=200,
+        mm_hashes_list=[["pending_hash"]],
+        mm_positions=[[PlaceholderRange(offset=0, length=100)]],
+        req_ids=["pending_req"],
     )[0]
 
-    future_hashes = [
-        f.identifier
-        for f in request.mm_features
-        if f.mm_position.offset + f.mm_position.length > NUM_COMPUTED_TOKENS
-    ]
+    scheduler.ec_connector.get_cache_status = Mock(
+        return_value=ECConnectorCacheStatus.PENDING
+    )
+    scheduler.ec_connector.has_cache_item = Mock(return_value=False)
 
-    assert future_hashes == [HASH_FUTURE], (
-        f"Expected only {HASH_FUTURE!r} from future mm feature filtering, "
-        f"got {future_hashes!r}. Past/boundary features must be filtered out."
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+
+    assert request.request_id in output.num_scheduled_tokens
+    assert output.num_scheduled_tokens[request.request_id] == 200
+    assert request.status == RequestStatus.RUNNING
+    assert request.request_id not in scheduler._ec_pending_mm_hash_by_req_id
+    _assert_right_encoder_cache_allocated(scheduler, requests=[request])
+    _assert_right_ec_connector_metadata(output, mm_features_list=[])
+    _assert_right_encoder_inputs(
+        output,
+        requests=[request],
+        expected_encoder_inputs=[[0]],
+        expected_total_reqs=1,
     )
 
 

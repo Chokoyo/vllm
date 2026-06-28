@@ -898,6 +898,9 @@ class GPUModelRunner(
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
+        self.ec_connector_output: ECConnectorOutput | None = None
+        self._ec_connector_output_this_step: ECConnectorOutput | None = None
+        self._ec_polled_this_step = False
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
         self.mamba_prev_last_scheduled_idx: CpuGpuBuffer | None = None
@@ -3352,12 +3355,36 @@ class GPUModelRunner(
             num_valid_physical_experts=old_num_physical_experts,
         )
 
+    def _attach_ec_connector_output(
+        self,
+        output: ModelRunnerOutput,
+        ec_connector_output: ECConnectorOutput | None,
+    ) -> ModelRunnerOutput:
+        if ec_connector_output is None:
+            return output
+        if output is EMPTY_MODEL_RUNNER_OUTPUT:
+            output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
+        output.ec_connector_output = ec_connector_output
+        return output
+
+    def _poll_ec_connector_no_forward_if_needed(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> ECConnectorOutput | None:
+        if has_ec_transfer() and not self._ec_polled_this_step:
+            self._ec_connector_output_this_step = (
+                ECConnectorModelRunnerMixin.ec_connector_no_forward(scheduler_output)
+            )
+            self._ec_polled_this_step = True
+        return self._ec_connector_output_this_step
+
     def _pool(
         self,
         hidden_states: torch.Tensor,
         num_scheduled_tokens: int,
         num_scheduled_tokens_np: np.ndarray,
         kv_connector_output: KVConnectorOutput | None,
+        ec_connector_output: ECConnectorOutput | None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         num_reqs = self.input_batch.num_reqs
         assert num_reqs == len(self.input_batch.pooling_params), (
@@ -3395,6 +3422,7 @@ class GPUModelRunner(
             req_ids=self.input_batch.req_ids.copy(),
             req_id_to_index=self.input_batch.req_id_to_index.copy(),
             kv_connector_output=kv_connector_output,
+            ec_connector_output=ec_connector_output,
         )
 
         if raw_pooler_output is None or not any(finished_mask):
@@ -3464,6 +3492,7 @@ class GPUModelRunner(
                 encoder_cache=self.encoder_cache,
             ) as ec_connector_output:
                 self._execute_mm_encoder(scheduler_output)
+                self.maybe_wait_for_ec_load_caches(self.encoder_cache)
                 mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
 
             # NOTE(woosuk): To unify token ids and soft tokens (vision
@@ -4064,6 +4093,9 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
+        self._ec_connector_output_this_step = None
+        self._ec_polled_this_step = False
+
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
 
@@ -4103,7 +4135,10 @@ class GPUModelRunner(
                     encoder_cache=self.encoder_cache,
                 ) as ec_connector_output:
                     self._execute_mm_encoder(scheduler_output)
-                    return make_empty_encoder_model_runner_output(scheduler_output)
+                    output = make_empty_encoder_model_runner_output(scheduler_output)
+                    return self._attach_ec_connector_output(
+                        output, ec_connector_output
+                    )
 
             if not num_scheduled_tokens:
                 if (
@@ -4118,10 +4153,18 @@ class GPUModelRunner(
                     # dummy run to ensure coordinate_batch_across_dp
                     # is called into to avoid out of sync issues.
                     self._dummy_run(1)
+                ec_connector_output = self._poll_ec_connector_no_forward_if_needed(
+                    scheduler_output
+                )
                 if not has_kv_transfer_group():
                     # Return empty ModelRunnerOutput if no work to do.
-                    return EMPTY_MODEL_RUNNER_OUTPUT
-                return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                    return self._attach_ec_connector_output(
+                        EMPTY_MODEL_RUNNER_OUTPUT, ec_connector_output
+                    )
+                output = self.kv_connector_no_forward(
+                    scheduler_output, self.vllm_config
+                )
+                return self._attach_ec_connector_output(output, ec_connector_output)
 
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (
@@ -4352,6 +4395,13 @@ class GPUModelRunner(
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)
                     self.kv_connector_output = kv_connector_output
+                    if not self._ec_polled_this_step:
+                        ec_connector_output = (
+                            self._poll_ec_connector_no_forward_if_needed(
+                                scheduler_output
+                            )
+                        )
+                    self.ec_connector_output = ec_connector_output
                     return hidden_states
 
                 if self.is_pooling_model:
@@ -4361,6 +4411,7 @@ class GPUModelRunner(
                         num_scheduled_tokens,
                         num_scheduled_tokens_np,
                         kv_connector_output,
+                        ec_connector_output,
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
@@ -4438,12 +4489,15 @@ class GPUModelRunner(
         if self.execute_model_state is None:
             kv_connector_output = self.kv_connector_output
             self.kv_connector_output = None
+            ec_connector_output = self.ec_connector_output
+            self.ec_connector_output = None
             # receive sampled token ids from the last PP rank.
             if self.use_async_scheduling and not get_pp_group().is_last_rank:
                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
             # In case of PP with kv transfer, we need to pass through the
-            # kv_connector_output
-            return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            # connector outputs
+            output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            return self._attach_ec_connector_output(output, ec_connector_output)
 
         # Unpack ephemeral state.
         (
@@ -4617,6 +4671,10 @@ class GPUModelRunner(
         # self.kv_connector_output may be modified during drafting
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
+        if not self._ec_polled_this_step:
+            ec_connector_output = self._poll_ec_connector_no_forward_if_needed(
+                scheduler_output
+            )
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
